@@ -323,19 +323,37 @@ def api_fetch_json(sb, url, xsrf_token=None):
     script = """
         var done = arguments[arguments.length - 1];
         fetch(arguments[0], {
-            headers: arguments[1]
+            headers: arguments[1],
+            credentials: 'same-origin'
         })
         .then(resp => {
+            var ct = (resp.headers.get('content-type') || '').toLowerCase();
+            // 403 + HTML = Cloudflare 挑战页（Just a moment...），不是登录失败
+            if (resp.status === 403 && ct.indexOf('text/html') >= 0) {
+                return {_cf_challenge: true, status: 403};
+            }
             if (resp.status === 401) return {_error: 'unauthorized'};
-            return resp.json();
+            return resp.text().then(t => {
+                try { return JSON.parse(t); }
+                catch (e) {
+                    // 非 JSON 响应也单独标记，便于和 CF 挑战区分
+                    return {_bad_body: true, status: resp.status, head: t.slice(0, 120)};
+                }
+            });
         })
         .then(data => done(data))
         .catch(err => done({_error: err.toString()}));
     """
     result = sb.driver.execute_async_script(script, url, headers)
+    if isinstance(result, dict) and result.get("_cf_challenge"):
+        print(f"[ERROR]   API 请求被 Cloudflare 拦截（403 挑战页，非 Cookie 问题）")
+        return result
+    if isinstance(result, dict) and result.get("_bad_body"):
+        print(f"[ERROR]   API 返回非 JSON: status={result.get('status')} head={result.get('head')!r}")
+        return result
     if isinstance(result, dict) and "_error" in result:
         print(f"[ERROR]   fetch 失败: {result['_error']}")
-        return None
+        return result
     return result
 
 
@@ -929,12 +947,14 @@ def process_single_server(sb, server_info, cookie_name, cookie_value, cookie_str
         sb.uc_open_with_reconnect(server_url, reconnect_time=5)
         time.sleep(3)
 
-        if not check_api_logged_in(sb):
+        ok, _ = check_api_logged_in(sb)
+        if not ok:
             inject_cookie(sb, cookie_name, cookie_value)
             sb.uc_open_with_reconnect(server_url, reconnect_time=5)
             time.sleep(3)
 
-        if not check_api_logged_in(sb):
+        ok, _ = check_api_logged_in(sb)
+        if not ok:
             ss_path = f"{screenshot_prefix}_login_fail.png"
             sb.save_screenshot(ss_path)
             srv_result.update(status="error", message="浏览器登录失败", screenshot=ss_path)
@@ -1053,23 +1073,52 @@ def safe_current_url(sb):
 
 
 def check_api_logged_in(sb):
-    """通过 API 判断登录状态（权威）：能拉到服务器列表且非 unauthorized 即视为已登录。"""
-    try:
+    """通过 API 判断登录状态（权威）。
+
+    返回 (ok, reason)：
+      ok=True     已登录（API 返回服务器列表）
+      ok=False + reason:
+        cf          被 Cloudflare 拦截（403 挑战页）——未必是 Cookie 问题
+        unauthorized Cookie 无效 / 未生效
+        unknown      未知结构 / 网络异常
+    """
+    for attempt in range(3):
         xsrf = get_xsrf_token_from_cookies(sb)
         data = api_fetch_json(sb, f"{API_BASE_URL}?page=1", xsrf)
+        if isinstance(data, dict) and data.get("_cf_challenge"):
+            print(f"[WARN]   Cloudflare 拦截 API（第{attempt+1}次）。等待后重试，并尝试导航方式取数据...")
+            time.sleep(4)
+            # 方式B：直接导航到 API URL，浏览器会完成 CF 的 JS 挑战再返回
+            try:
+                sb.uc_open_with_reconnect(f"{API_BASE_URL}?page=1", reconnect_time=5)
+                time.sleep(3)
+                txt = sb.get_page_source()
+                body = txt.strip()
+                if body.startswith("{"):
+                    import json as _json
+                    d = _json.loads(body)
+                    if isinstance(d, dict) and "data" in d:
+                        print("[INFO]   导航方式拿到 API JSON，登录态有效 ✅")
+                        return (True, "ok")
+                elif "Just a moment" in body or "cf-challenge" in body:
+                    print("[WARN]   导航也被 Cloudflare 拦截（数据中心 IP 常被重点挑战）")
+            except Exception as e:
+                print(f"[WARN]   导航方式失败: {e}")
+            continue
         if data is None:
-            print("[WARN]   API 探测返回空（网络/页面异常）")
-            return False
-        if data.get("error") == "unauthorized" or data.get("status") == "unauthorized":
+            print(f"[WARN]   API 探测返回空（第{attempt+1}次），网络/页面异常")
+            time.sleep(3)
+            continue
+        if isinstance(data, dict) and (data.get("error") == "unauthorized"
+                                       or data.get("status") == "unauthorized"):
             print("[WARN]   API 探测返回 unauthorized（Cookie 无效或未生效）")
-            return False
+            return (False, "unauthorized")
         if isinstance(data, dict) and "data" in data:
-            return True
+            return (True, "ok")
         print(f"[WARN]   API 探测返回未知结构: {str(data)[:120]}")
-        return False
-    except Exception as e:
-        print(f"[WARN]   API 探测异常: {e}")
-        return False
+        return (False, "unknown")
+    print("[WARN]   API 尝试 3 次均失败（可能被 Cloudflare 持续拦截）")
+    return (False, "cf")
 
 
 def inject_cookie(sb, cookie_name, cookie_value):
@@ -1163,24 +1212,30 @@ def process_single_account(sb, account, account_index):
     time.sleep(3)
 
     # 权威登录判断：直接调 API，避免页面 DOM 判断误报
-    recognized = check_api_logged_in(sb)
+    recognized, reason = check_api_logged_in(sb)
 
     if not recognized:
         print("[WARN]   首次 API 未识别到登录态，刷新/回站重试...")
         sb.uc_open_with_reconnect(f"https://{DOMAIN}/server/", reconnect_time=5)
         time.sleep(3)
-        recognized = check_api_logged_in(sb)
+        recognized, reason = check_api_logged_in(sb)
 
     if not recognized:
         ss_path = f"acc{account_index+1}_login_fail.png"
         sb.save_screenshot(ss_path)
-        result["status"] = "cookie_invalid"
-        result["message"] = "Cookie 失效或登录失败（Turnstile 通过后仍无法登录）"
-        print(f"[INFO]   已保存失败截图: {ss_path}")
-        print("\n[提示] 如果 Cookie 确认无误，请检查：")
-        print("       1. Cookie 是否已换行/被截断（在 GitHub Secrets 中重贴完整值）")
-        print("       2. remember_web_ 前缀是否完整（Laravel 签名 Cookie 名带 40 位前缀）")
-        print("       3. 是否与其他浏览器/账号混用了 Cookie")
+        if reason == "cf":
+            result["status"] = "error"
+            result["message"] = "被 Cloudflare 拦截，未能确认登录态（可能是数据中心 IP 被重点挑战）"
+            print(f"[INFO]   已保存截图: {ss_path}")
+            print("[提示] 这不是 Cookie 失效，是 CF 挑战。可稍后重试；若多次失败，考虑换 IPv6/代理。")
+        else:
+            result["status"] = "cookie_invalid"
+            result["message"] = "Cookie 失效或登录失败（Turnstile 通过后仍无法登录）"
+            print(f"[INFO]   已保存失败截图: {ss_path}")
+            print("\n[提示] 如果 Cookie 确认无误，请检查：")
+            print("       1. Cookie 是否已换行/被截断（在 GitHub Secrets 中重贴完整值）")
+            print("       2. remember_web_ 前缀是否完整（Laravel 签名 Cookie 名带 40 位前缀）")
+            print("       3. 是否与其他浏览器/账号混用了 Cookie")
         return result
 
     xsrf_token = get_xsrf_token_from_cookies(sb)
