@@ -865,23 +865,6 @@ def check_renewal_button_enabled(sb):
     return (True, True, xpath, "")
 
 
-def is_logged_in(sb):
-    try:
-        url = sb.get_current_url()
-        if "/login" in url or "/auth" in url:
-            return False
-        if get_expiry_from_page(sb) != "Unknown":
-            return True
-        if find_renewal_button(sb):
-            return True
-        if sb.is_element_present("//div[contains(@class,'ServerControls')]") or \
-           sb.is_element_present("//a[contains(@href,'/server/')]"):
-            return True
-        return False
-    except:
-        return False
-
-
 def check_and_update_cookie(sb, cookie_env, original_cookie_value, remark=""):
     try:
         cookies = sb.get_cookies()
@@ -946,12 +929,12 @@ def process_single_server(sb, server_info, cookie_name, cookie_value, cookie_str
         sb.uc_open_with_reconnect(server_url, reconnect_time=5)
         time.sleep(3)
 
-        if not is_logged_in(sb):
+        if not check_api_logged_in(sb):
             inject_cookie(sb, cookie_name, cookie_value)
             sb.uc_open_with_reconnect(server_url, reconnect_time=5)
             time.sleep(3)
 
-        if not is_logged_in(sb):
+        if not check_api_logged_in(sb):
             ss_path = f"{screenshot_prefix}_login_fail.png"
             sb.save_screenshot(ss_path)
             srv_result.update(status="error", message="浏览器登录失败", screenshot=ss_path)
@@ -1069,6 +1052,26 @@ def safe_current_url(sb):
         return "(获取失败)"
 
 
+def check_api_logged_in(sb):
+    """通过 API 判断登录状态（权威）：能拉到服务器列表且非 unauthorized 即视为已登录。"""
+    try:
+        xsrf = get_xsrf_token_from_cookies(sb)
+        data = api_fetch_json(sb, f"{API_BASE_URL}?page=1", xsrf)
+        if data is None:
+            print("[WARN]   API 探测返回空（网络/页面异常）")
+            return False
+        if data.get("error") == "unauthorized" or data.get("status") == "unauthorized":
+            print("[WARN]   API 探测返回 unauthorized（Cookie 无效或未生效）")
+            return False
+        if isinstance(data, dict) and "data" in data:
+            return True
+        print(f"[WARN]   API 探测返回未知结构: {str(data)[:120]}")
+        return False
+    except Exception as e:
+        print(f"[WARN]   API 探测异常: {e}")
+        return False
+
+
 def inject_cookie(sb, cookie_name, cookie_value):
     """注入登录 Cookie。
 
@@ -1159,16 +1162,25 @@ def process_single_account(sb, account, account_index):
     sb.uc_open_with_reconnect(f"https://{DOMAIN}/", reconnect_time=5)
     time.sleep(3)
 
-    if not is_logged_in(sb):
-        print("[WARN]   未检测到登录状态，尝试刷新...")
+    # 权威登录判断：直接调 API，避免页面 DOM 判断误报
+    recognized = check_api_logged_in(sb)
+
+    if not recognized:
+        print("[WARN]   首次 API 未识别到登录态，刷新/回站重试...")
         sb.uc_open_with_reconnect(f"https://{DOMAIN}/server/", reconnect_time=5)
         time.sleep(3)
+        recognized = check_api_logged_in(sb)
 
-    if not is_logged_in(sb):
+    if not recognized:
         ss_path = f"acc{account_index+1}_login_fail.png"
         sb.save_screenshot(ss_path)
         result["status"] = "cookie_invalid"
         result["message"] = "Cookie 失效或登录失败（Turnstile 通过后仍无法登录）"
+        print(f"[INFO]   已保存失败截图: {ss_path}")
+        print("\n[提示] 如果 Cookie 确认无误，请检查：")
+        print("       1. Cookie 是否已换行/被截断（在 GitHub Secrets 中重贴完整值）")
+        print("       2. remember_web_ 前缀是否完整（Laravel 签名 Cookie 名带 40 位前缀）")
+        print("       3. 是否与其他浏览器/账号混用了 Cookie")
         return result
 
     xsrf_token = get_xsrf_token_from_cookies(sb)
