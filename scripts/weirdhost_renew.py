@@ -141,7 +141,15 @@ def parse_weirdhost_cookie(cookie_str):
     if "=" in cookie_str:
         parts = cookie_str.split("=", 1)
         if len(parts) == 2:
-            return (parts[0].strip(), unquote(parts[1].strip()))
+            cname = parts[0].strip()
+            cvalue = parts[1].strip()
+            # Cookie 值是从浏览器直接拷贝的原始值（Laravel 加密 Token，base64 形式），
+            # 绝不能做 URL 解码（unquote 会解码 %xx，导致值损坏）。
+            # 同时校验值内不能有空白/控制字符（否则 Chrome 会拒绝该 Cookie）。
+            if re.search(r"[\x00-\x20\x7f]", cvalue):
+                print("[WARN]   Cookie 值包含非法字符（换行/空格等），请从浏览器开发者工具重新拷贝")
+                return (None, None)
+            return (cname, cvalue)
     return (None, None)
 
 
@@ -448,8 +456,21 @@ def handle_turnstile(sb, timeout=120):
             print("[INFO]   Turnstile 令牌已生成 ✅")
             return True
         if not ts_exists(sb):
-            print("[INFO]   Turnstile 元素消失，可能已通过")
-            return True
+            if is_on_domain(sb):
+                print("[INFO]   Turnstile 元素消失，可能已通过")
+                return True
+            # 元素消失但页面已不在目标域名上（常见：自动化被识别后被 Cloudflare
+            # 跳转到 challenges.cloudflare.com 中间页），此时不能判定为通过，先回到站点。
+            print(f"[WARN]   元素消失但页面已不在 {DOMAIN}（当前: {safe_current_url(sb)}），尝试回到站点...")
+            try:
+                sb.uc_open_with_reconnect(f"https://{DOMAIN}/", reconnect_time=5)
+                time.sleep(2)
+            except Exception as e:
+                print(f"[WARN]   回到站点失败: {e}")
+            if not ts_exists(sb):
+                print("[INFO]   回到站点后 Turnstile 未出现，视为通过")
+                return is_on_domain(sb)
+            print("[INFO]   回到站点后仍检测到 Turnstile，继续循环处理")
 
         expand_turnstile(sb)
         focus_turnstile_area(sb)
@@ -926,7 +947,7 @@ def process_single_server(sb, server_info, cookie_name, cookie_value, cookie_str
         time.sleep(3)
 
         if not is_logged_in(sb):
-            sb.add_cookie({"name": cookie_name, "value": cookie_value, "domain": DOMAIN, "path": "/"})
+            inject_cookie(sb, cookie_name, cookie_value)
             sb.uc_open_with_reconnect(server_url, reconnect_time=5)
             time.sleep(3)
 
@@ -1033,6 +1054,74 @@ def process_single_server(sb, server_info, cookie_name, cookie_value, cookie_str
 #  单个账号处理
 # ============================================================
 
+def is_on_domain(sb, domain=DOMAIN):
+    try:
+        url = sb.get_current_url() or ""
+        return url.startswith(f"https://{domain}") or url.startswith(f"http://{domain}")
+    except Exception:
+        return False
+
+
+def safe_current_url(sb):
+    try:
+        return sb.get_current_url() or "(空)"
+    except Exception:
+        return "(获取失败)"
+
+
+def inject_cookie(sb, cookie_name, cookie_value):
+    """注入登录 Cookie。
+
+    优先使用 CDP Network.setCookie：不受“当前页面域名必须与 Cookie 域名一致”
+    的限制，且可以覆盖同名 Cookie；不可用时回退到 Selenium add_cookie
+    （该方式要求当前页面在目标域名上，因此会先确保页面停留在 DOMAIN）。
+    """
+    print(f"[INFO]   注入 Cookie: {cookie_name}")
+    try:
+        sb.driver.switch_to.default_content()
+    except Exception:
+        pass
+
+    # add_cookie 要求当前页面在目标域名上，先兜底回到站点
+    if not is_on_domain(sb):
+        print(f"[WARN]   当前页面不在 {DOMAIN}（{safe_current_url(sb)}），先回到站点...")
+        try:
+            sb.uc_open_with_reconnect(f"https://{DOMAIN}/", reconnect_time=5)
+            time.sleep(2)
+        except Exception as e:
+            print(f"[WARN]   回到站点失败: {e}")
+
+    # 方式1：CDP 直接写入浏览器 Cookie 存储
+    cdp_cmd = getattr(sb.driver, "execute_cdp_cmd", None)
+    if cdp_cmd is not None:
+        try:
+            resp = cdp_cmd("Network.setCookie", {
+                "name": cookie_name,
+                "value": cookie_value,
+                "domain": DOMAIN,
+                "path": "/",
+                "url": f"https://{DOMAIN}/",
+                "httpOnly": True,
+            })
+            if resp and resp.get("success"):
+                print(f"[INFO]   ✅ Cookie 注入成功（CDP）")
+                return True
+            print(f"[WARN]   CDP 注入未成功: {resp}，改用 add_cookie")
+        except Exception as e:
+            print(f"[WARN]   CDP 注入不可用（{type(e).__name__}），改用 add_cookie")
+
+    # 方式2：Selenium add_cookie
+    try:
+        sb.add_cookie({"name": cookie_name, "value": cookie_value, "domain": DOMAIN, "path": "/"})
+        print(f"[INFO]   ✅ Cookie 注入成功（add_cookie）")
+        return True
+    except Exception as e:
+        print(f"[ERROR]   Cookie 注入失败: {e}")
+        print(f"[ERROR]   当前页面: {safe_current_url(sb)}")
+        print(f"[ERROR]   Cookie: {cookie_name}（值长度 {len(cookie_value)}）")
+        return False
+
+
 def process_single_account(sb, account, account_index):
     remark = account.get("remark", f"账号{account_index + 1}")
     cookie_env = account.get("cookie_env", "")
@@ -1066,7 +1155,7 @@ def process_single_account(sb, account, account_index):
 
     # Step 2: 注入 Cookie 并登录
     print(f"[INFO] [步骤2] 注入 Cookie 并登录...")
-    sb.add_cookie({"name": cookie_name, "value": cookie_value, "domain": DOMAIN, "path": "/"})
+    inject_cookie(sb, cookie_name, cookie_value)
     sb.uc_open_with_reconnect(f"https://{DOMAIN}/", reconnect_time=5)
     time.sleep(3)
 
